@@ -1,3 +1,413 @@
+// deleteMaintainer
+func deleteMaintainer(c *gin.Context) {
+	authedUserID, ok := getUserIDFromContext(c)
+	if !ok {
+		respondErr(c, http.StatusUnauthorized, "invalid user ID in context", nil)
+		return
+	}
+
+	p_id, err := getIntParam(c, "id")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project id"})
+		return
+	}
+
+	user_id_to_remove, err := getIntParam(c, "user_id")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user id to remove"})
+		return
+	}
+
+	hasPermission, err := isProjectAdminOrCreator(authedUserID, p_id)
+	if err != nil {
+		if err.Error() == "project not found" {
+			respondErr(c, http.StatusNotFound, "project not found", nil)
+		} else {
+			respondErr(c, http.StatusInternalServerError, "failed to check permissions", err)
+		}
+		return
+	}
+	if !hasPermission {
+		respondErr(c, http.StatusForbidden, "user is not authorized to remove maintainers", nil)
+		return
+	}
+
+	cmdTag, err := conn.Exec(context.Background(),
+		`DELETE FROM maintainers WHERE p_id = $1 AND user_id = $2`,
+		p_id, user_id_to_remove)
+
+	if err != nil {
+		respondErr(c, http.StatusInternalServerError, "failed to remove maintainer", err)
+		return
+	}
+
+	if cmdTag.RowsAffected() == 0 {
+		respondErr(c, http.StatusNotFound, "maintainer not found for this project", nil)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "maintainer removed",
+		"p_id":    p_id,
+		"user_id": user_id_to_remove,
+	})
+}
+
+// getAllDeletedProjects
+func getAllDeletedProjects(c *gin.Context) {
+	rows, err := conn.Query(context.Background(),
+		"SELECT p_id, name, description, creator_id, creator_name, deleted_date, image FROM deleted_projects")
+	if err != nil {
+		respondErr(c, http.StatusInternalServerError, "failed to fetch deleted projects", err)
+		return
+	}
+	defer rows.Close()
+
+	var out []DeletedProject
+	for rows.Next() {
+		var d DeletedProject
+		var imgBytes []byte
+		if err := rows.Scan(&d.PID, &d.Name, &d.Description, &d.CreatorID, &d.CreatorName, &d.DeletedDate, &imgBytes); err != nil {
+			respondErr(c, http.StatusInternalServerError, "scan failed", err)
+			return
+		}
+		if len(imgBytes) > 0 {
+			d.Image = base64.StdEncoding.EncodeToString(imgBytes)
+		}
+		out = append(out, d)
+	}
+
+	c.JSON(http.StatusOK, out)
+}
+
+// getMyDeletedProjects
+func getMyDeletedProjects(c *gin.Context) {
+	creatorID, ok := getUserIDFromContext(c)
+	if !ok {
+		respondErr(c, http.StatusUnauthorized, "invalid user ID in context", nil)
+		return
+	}
+
+	rows, err := conn.Query(context.Background(),
+		"SELECT p_id, name, description, creator_id, creator_name, deleted_date, image FROM deleted_projects WHERE creator_id=$1", creatorID)
+	if err != nil {
+		respondErr(c, http.StatusInternalServerError, "failed to fetch your deleted projects", err)
+		return
+	}
+	defer rows.Close()
+
+	var out []DeletedProject
+	for rows.Next() {
+		var d DeletedProject
+		var imgBytes []byte
+		if err := rows.Scan(&d.PID, &d.Name, &d.Description, &d.CreatorID, &d.CreatorName, &d.DeletedDate, &imgBytes); err != nil {
+			respondErr(c, http.StatusInternalServerError, "scan failed", err)
+			return
+		}
+		if len(imgBytes) > 0 {
+			d.Image = base64.StdEncoding.EncodeToString(imgBytes)
+		}
+		out = append(out, d)
+	}
+
+	c.JSON(http.StatusOK, out)
+}
+
+// addContributor
+func addContributor(c *gin.Context) {
+	authedUserID, ok := getUserIDFromContext(c)
+	if !ok {
+		respondErr(c, http.StatusUnauthorized, "invalid user ID in context", nil)
+		return
+	}
+
+	p_id, err := getIntParam(c, "id")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project id"})
+		return
+	}
+
+	var req addContributorReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body, user_id and user_name are required"})
+		return
+	}
+
+	hasPermission, err := isProjectAdminOrCreatorOrMaintainer(authedUserID, p_id)
+	if err != nil {
+		if err.Error() == "project not found" {
+			respondErr(c, http.StatusNotFound, "project not found", nil)
+		} else {
+			respondErr(c, http.StatusInternalServerError, "failed to check permissions", err)
+		}
+		return
+	}
+	if !hasPermission {
+		respondErr(c, http.StatusForbidden, "Only the Project Creator, Maintainer, Admin, or Superadmin can add a contributor.", nil)
+		return
+	}
+
+	tx, err := conn.Begin(context.Background())
+	if err != nil {
+		respondErr(c, http.StatusInternalServerError, "tx begin failed", err)
+		return
+	}
+	defer tx.Rollback(context.Background())
+
+	if _, err := tx.Exec(context.Background(),
+		`INSERT INTO names (id, name) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name`,
+		req.UserID, req.UserName); err != nil {
+		respondErr(c, http.StatusInternalServerError, "failed to upsert user in names table", err)
+		return
+	}
+
+	row := tx.QueryRow(context.Background(),
+		`INSERT INTO contributors (p_id, user_id, c_name)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (user_id, p_id) DO NOTHING 
+        RETURNING c_id`,
+		p_id, req.UserID, req.UserName)
+
+	var c_id int
+	if err := row.Scan(&c_id); err != nil {
+		if err == pgx.ErrNoRows {
+			respondErr(c, http.StatusConflict, "user is already a contributor for this project", nil)
+			return
+		}
+		respondErr(c, http.StatusInternalServerError, "failed to add contributor", err)
+		return
+	}
+
+	if err := tx.Commit(context.Background()); err != nil {
+		respondErr(c, http.StatusInternalServerError, "tx commit failed", err)
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{
+		"c_id":    c_id,
+		"p_id":    p_id,
+		"user_id": req.UserID,
+		"status":  "contributor added",
+	})
+}
+
+// deleteContributor
+func deleteContributor(c *gin.Context) {
+	authedUserID, ok := getUserIDFromContext(c)
+	if !ok {
+		respondErr(c, http.StatusUnauthorized, "invalid user ID in context", nil)
+		return
+	}
+
+	p_id, err := getIntParam(c, "id")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project id"})
+		return
+	}
+
+	user_id_to_remove, err := getIntParam(c, "user_id")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user id to remove"})
+		return
+	}
+
+	hasPermission, err := isProjectAdminOrCreatorOrMaintainer(authedUserID, p_id)
+	if err != nil {
+		if err.Error() == "project not found" {
+			respondErr(c, http.StatusNotFound, "project not found", nil)
+		} else {
+			respondErr(c, http.StatusInternalServerError, "failed to check permissions", err)
+		}
+		return
+	}
+	if !hasPermission {
+		respondErr(c, http.StatusForbidden, "Only the Project Creator, Maintainer, Admin, or Superadmin can remove a contributor.", nil)
+		return
+	}
+
+	cmdTag, err := conn.Exec(context.Background(),
+		`DELETE FROM contributors WHERE p_id = $1 AND user_id = $2`,
+		p_id, user_id_to_remove)
+
+	if err != nil {
+		respondErr(c, http.StatusInternalServerError, "failed to remove contributor", err)
+		return
+	}
+
+	if cmdTag.RowsAffected() == 0 {
+		respondErr(c, http.StatusNotFound, "contributor not found for this project", nil)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "contributor removed",
+		"p_id":    p_id,
+		"user_id": user_id_to_remove,
+	})
+}
+
+// getPendingProjects
+func getPendingProjects(c *gin.Context) {
+	rows, err := conn.Query(context.Background(),
+		"SELECT r_id, name, description, creator_id, creator_name, status, submitted_at, image FROM buffer_projects WHERE status='pending'")
+	if err != nil {
+		respondErr(c, http.StatusInternalServerError, "failed to fetch pending projects", err)
+		return
+	}
+	defer rows.Close()
+
+	var out []BufferProject
+	for rows.Next() {
+		var b BufferProject
+		var imgBytes []byte
+		if err := rows.Scan(&b.RID, &b.Name, &b.Description, &b.CreatorID, &b.CreatorName, &b.Status, &b.SubmittedAt, &imgBytes); err != nil {
+			respondErr(c, http.StatusInternalServerError, "scan failed", err)
+			return
+		}
+		if len(imgBytes) > 0 {
+			b.Image = base64.StdEncoding.EncodeToString(imgBytes)
+		}
+		out = append(out, b)
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// approveProject: move buffer -> approved (including image) in a transaction
+func approveProject(c *gin.Context) {
+	val, ok := c.Get("user_id")
+	if !ok {
+		respondErr(c, http.StatusUnauthorized, "invalid user ID in context", nil)
+		return
+	}
+	userIDStr := fmt.Sprintf("%v", val)
+
+	isSuperAdmin := auth1.Check_permissions(userIDStr, SpaceSuperadmins, MemberRole)
+	isAdmin := auth1.Check_permissions(userIDStr, SpaceAdmins, MemberRole)
+
+	if !(isSuperAdmin || isAdmin) {
+		respondErr(c, http.StatusForbidden, "permission denied: requires admin or superadmin", nil)
+		return
+	}
+
+	rid, err := getIntParam(c, "id")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid buffer project id"})
+		return
+	}
+
+	tx, err := conn.Begin(context.Background())
+	if err != nil {
+		respondErr(c, http.StatusInternalServerError, "tx begin failed", err)
+		return
+	}
+	defer tx.Rollback(context.Background())
+
+	// fetch buffer row
+	var name, desc, creatorName, status string
+	var creatorID int
+	var submittedAt time.Time
+	var imgBytes []byte
+	err = tx.QueryRow(context.Background(),
+		"SELECT name, description, creator_id, creator_name, status, submitted_at, image FROM buffer_projects WHERE r_id=$1 AND status='pending'",
+		rid).Scan(&name, &desc, &creatorID, &creatorName, &status, &submittedAt, &imgBytes)
+	if err == pgx.ErrNoRows {
+		respondErr(c, http.StatusNotFound, "project not found or not pending", nil)
+		return
+	}
+	if err != nil {
+		respondErr(c, http.StatusInternalServerError, "failed to fetch buffer project", err)
+		return
+	}
+
+	// insert into approved_projects (preserve image)
+	var newPID int
+	err = tx.QueryRow(context.Background(),
+		`INSERT INTO approved_projects (name, description, creator_id, creator_name, start_date, status, image)
+		 VALUES ($1,$2,$3,$4,CURRENT_DATE,'in_progress',$5) RETURNING p_id`,
+		name, desc, creatorID, creatorName, imgBytes).Scan(&newPID)
+	if err != nil {
+		respondErr(c, http.StatusInternalServerError, "failed to move to approved_projects", err)
+		return
+	}
+
+	// delete from buffer_projects
+	if _, err := tx.Exec(context.Background(), `DELETE FROM buffer_projects WHERE r_id=$1`, rid); err != nil {
+		respondErr(c, http.StatusInternalServerError, "failed to delete buffer project", err)
+		return
+	}
+
+	if err := tx.Commit(context.Background()); err != nil {
+		respondErr(c, http.StatusInternalServerError, "tx commit failed", err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Project approved successfully",
+		"r_id":    rid,
+		"p_id":    newPID,
+		"status":  "approved",
+	})
+}
+
+// rejectProject: mark buffer project as rejected (keeps image)
+func rejectProject(c *gin.Context) {
+	rid, err := getIntParam(c, "id")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid buffer project id"})
+		return
+	}
+
+	cmdTag, err := conn.Exec(context.Background(),
+		`UPDATE buffer_projects SET status='rejected' WHERE r_id=$1 AND status='pending'`, rid)
+	if err != nil {
+		respondErr(c, http.StatusInternalServerError, "reject failed", err)
+		return
+	}
+	if cmdTag.RowsAffected() == 0 {
+		respondErr(c, http.StatusNotFound, "project not found or not pending", nil)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "rejected"})
+}
+
+// assignSuperAdmin
+func assignSuperAdmin(c *gin.Context) {
+	val, exists := c.Get("user_id")
+	if !exists {
+		respondErr(c, http.StatusUnauthorized, "missing user context", nil)
+		return
+	}
+	authedUserIDStr := fmt.Sprintf("%v", val)
+
+	if !HasRole(authedUserIDStr, "superadmin") {
+		respondErr(c, http.StatusForbidden, "permission denied: only a superadmin can assign this role", nil)
+		return
+	}
+
+	var req assignUserReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	if req.UserName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_name is required"})
+		return
+	}
+
+	if err := AssignMemberToSpace(req.UserID, req.UserName, SpaceSuperadmins); err != nil {
+		respondErr(c, http.StatusInternalServerError, "failed to assign superadmin role", err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Superadmin role assigned successfully",
+		"user_id": req.UserID,
+		"space":   SpaceSuperadmins,
+	})
+}
+
 // assignAdmin
 func assignAdmin(c *gin.Context) {
 
