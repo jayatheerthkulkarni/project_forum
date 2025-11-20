@@ -1,3 +1,316 @@
+// ---------------- Middleware ----------------
+
+// AuthMiddleware validates JWT from Authorization header and sets user_id and user_id_int in context.
+// Falls back to X-Dummy-User header for local testing.
+func AuthMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		authH := c.GetHeader("Authorization")
+		if authH != "" {
+			parts := strings.Fields(authH)
+			if len(parts) == 2 && strings.ToLower(parts[0]) == "bearer" {
+				claims, err := auth1.Login_jwt(parts[1])
+				if err != nil {
+					c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
+					return
+				}
+				c.Set("user_id", claims.UserID)
+				if n, err := strconv.Atoi(claims.UserID); err == nil {
+					c.Set("user_id_int", n)
+				}
+				c.Next()
+				return
+			}
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid authorization header"})
+			return
+		}
+
+		// fallback for local testing
+		dummy := c.GetHeader("X-Dummy-User")
+		if dummy != "" {
+			c.Set("user_id", dummy)
+			if n, err := strconv.Atoi(dummy); err == nil {
+				c.Set("user_id_int", n)
+			}
+			c.Next()
+			return
+		}
+
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing authorization"})
+	}
+}
+
+// RequireRole checks if current user has the provided high-level role.
+func RequireRole(required string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		val, exists := c.Get("user_id")
+		if !exists {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "missing user context"})
+			c.Abort()
+			return
+		}
+		userIDStr := fmt.Sprintf("%v", val)
+		if userIDStr == "" {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
+			c.Abort()
+			return
+		}
+		if !HasRole(userIDStr, required) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "permission denied for this role"})
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
+// ---------------- Handlers ----------------
+
+// Register endpoint: register user in auth DB, upsert to names (TEXT id) and assign SpaceUsers permission
+func registerUser(c *gin.Context) {
+	var req registerReq
+	if err := c.ShouldBind(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON/form body - username and password required"})
+		return
+	}
+
+	// Register user in auth DB
+	if err := auth1.Register_user(req.Username, req.Password); err != nil {
+		respondErr(c, http.StatusInternalServerError, "failed to register user", err)
+		return
+	}
+
+	// Upsert into names table using TEXT id (supports numeric and non-numeric usernames)
+	if _, err := conn.Exec(context.Background(),
+		`INSERT INTO names (id, name) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name`,
+		req.Username, req.Username); err != nil {
+		// warn but do not fail registration
+		log.Printf("warning: failed to upsert into names table: %v", err)
+	}
+
+	// Assign default user permission in auth DB (using username string as user_id)
+	if err := auth1.Create_permissions(req.Username, SpaceUsers, MemberRole); err != nil {
+		log.Printf("warning: failed to add default user permission: %v", err)
+	}
+
+	c.JSON(http.StatusCreated, gin.H{"message": "user registered and default permissions assigned", "username": req.Username})
+}
+
+// Login endpoint: validate credentials and return JWT (2 weeks expiry)
+func loginUser(c *gin.Context) {
+	var req registerReq
+	if err := c.ShouldBind(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON/form body - username and password required"})
+		return
+	}
+
+	if !auth1.Login_user(req.Username, req.Password) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid username or password"})
+		return
+	}
+
+	token, err := auth1.Generate_token(req.Username, time.Hour*24*14) // 2 weeks
+	if err != nil {
+		respondErr(c, http.StatusInternalServerError, "failed to generate token", err)
+		return
+	}
+
+	// Return token in response and set cookie (optional)
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     "session",
+		Value:    token,
+		Path:     "/",
+		Domain:   "",
+		MaxAge:   int((14 * 24 * time.Hour).Seconds()),
+		Secure:   false, // set true in production with HTTPS
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+
+	c.JSON(http.StatusOK, gin.H{"message": "login successful", "token": token})
+}
+
+// helper: read uploaded file into []byte safely
+func readUploadedFileBytes(fh *multipart.FileHeader) ([]byte, error) {
+	if fh == nil {
+		return nil, nil
+	}
+	f, err := fh.Open()
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
+}
+
+// get_All_Proj returns all approved projects (includes base64 image)
+func get_All_Proj(c *gin.Context) {
+	rows, err := conn.Query(context.Background(),
+		"SELECT p_id, name, description, creator_id, creator_name, start_date, status, image FROM approved_projects")
+	if err != nil {
+		respondErr(c, http.StatusInternalServerError, "failed to fetch projects", err)
+		return
+	}
+	defer rows.Close()
+
+	var out []Project
+	for rows.Next() {
+		var p Project
+		var sd time.Time
+		var imgBytes []byte
+		if err := rows.Scan(&p.PID, &p.Name, &p.Description, &p.CreatorID, &p.CreatorName, &sd, &p.Status, &imgBytes); err != nil {
+			respondErr(c, http.StatusInternalServerError, "scan failed", err)
+			return
+		}
+		p.StartDate = sd
+		if len(imgBytes) > 0 {
+			p.Image = base64.StdEncoding.EncodeToString(imgBytes)
+		}
+		out = append(out, p)
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// createProject accepts multipart form: name, description, image (optional) and stores image as BYTEA.
+// Admins/superadmins: directly into approved_projects. Regular users: into buffer_projects.
+func createProject(c *gin.Context) {
+	creatorID, ok := getUserIDFromContext(c)
+	if !ok {
+		respondErr(c, http.StatusUnauthorized, "invalid user ID in context", nil)
+		return
+	}
+
+	// Parse multipart form (max memory ephemeral); Gin's c.FormFile works without explicit ParseMultipartForm
+	name := c.PostForm("name")
+	desc := c.PostForm("description")
+	if name == "" || desc == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name and description are required"})
+		return
+	}
+
+	// read uploaded file (optional)
+	var imageBytes []byte
+	if fh, err := c.FormFile("image"); err == nil && fh != nil {
+		if b, err := readUploadedFileBytes(fh); err == nil {
+			imageBytes = b
+		} else {
+			respondErr(c, http.StatusInternalServerError, "failed to read uploaded image", err)
+			return
+		}
+	}
+
+	val, _ := c.Get("user_id")
+	creatorIDStr := fmt.Sprintf("%v", val)
+	isSuperAdmin := auth1.Check_permissions(creatorIDStr, SpaceSuperadmins, MemberRole)
+	isAdmin := auth1.Check_permissions(creatorIDStr, SpaceAdmins, MemberRole)
+
+	if isSuperAdmin || isAdmin {
+		row := conn.QueryRow(context.Background(),
+			`INSERT INTO approved_projects (name, description, creator_id, creator_name, start_date, status, image)
+			 VALUES ($1,$2,$3,(SELECT COALESCE(name,'Unknown') FROM names WHERE id=$3), CURRENT_DATE, 'in_progress', $4) RETURNING p_id`,
+			name, desc, creatorID, imageBytes)
+
+		var pid int
+		if err := row.Scan(&pid); err != nil {
+			respondErr(c, http.StatusInternalServerError, "direct insert failed", err)
+			return
+		}
+		c.JSON(http.StatusCreated, gin.H{"p_id": pid, "status": "approved"})
+		return
+	}
+
+	// regular user: insert into buffer_projects
+	row := conn.QueryRow(context.Background(),
+		`INSERT INTO buffer_projects (name, description, creator_id, creator_name, status, submitted_at, image)
+		 VALUES ($1, $2, $3, (SELECT COALESCE(name,'Unknown') FROM names WHERE id=$3), 'pending', CURRENT_DATE, $4) RETURNING r_id`,
+		name, desc, creatorID, imageBytes)
+
+	var rid int
+	if err := row.Scan(&rid); err != nil {
+		respondErr(c, http.StatusInternalServerError, "failed to submit project", err)
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"r_id": rid, "status": "pending"})
+}
+
+// deleteProject: move approved project to deleted_projects (with image) and delete from approved_projects
+func deleteProject(c *gin.Context) {
+	pid, err := getIntParam(c, "id")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project id"})
+		return
+	}
+
+	userID, ok := getUserIDFromContext(c)
+	if !ok {
+		respondErr(c, http.StatusUnauthorized, "invalid user ID in context", nil)
+		return
+	}
+	val, _ := c.Get("user_id")
+	userIDStr := fmt.Sprintf("%v", val)
+
+	isSuperAdmin := auth1.Check_permissions(userIDStr, SpaceSuperadmins, MemberRole)
+	isAdmin := auth1.Check_permissions(userIDStr, SpaceAdmins, MemberRole)
+
+	var projectCreatorID int
+	var name, desc, creatorName string
+	var startDate time.Time
+	var status string
+	var imgBytes []byte
+
+	err = conn.QueryRow(context.Background(),
+		`SELECT name, description, creator_id, creator_name, start_date, status, image FROM approved_projects WHERE p_id=$1`, pid).
+		Scan(&name, &desc, &projectCreatorID, &creatorName, &startDate, &status, &imgBytes)
+	if err == pgx.ErrNoRows {
+		respondErr(c, http.StatusNotFound, "project not found", nil)
+		return
+	}
+	if err != nil {
+		respondErr(c, http.StatusInternalServerError, "failed to fetch project", err)
+		return
+	}
+
+	canDelete := isSuperAdmin || isAdmin || (userID == projectCreatorID)
+	if !canDelete {
+		respondErr(c, http.StatusForbidden, "you do not have permission to delete this project", nil)
+		return
+	}
+
+	tx, err := conn.Begin(context.Background())
+	if err != nil {
+		respondErr(c, http.StatusInternalServerError, "tx begin failed", err)
+		return
+	}
+	defer tx.Rollback(context.Background())
+
+	// insert into deleted_projects (keep image)
+	_, err = tx.Exec(context.Background(),
+		`INSERT INTO deleted_projects (p_id, name, description, creator_id, creator_name, deleted_date, image)
+		 VALUES ($1,$2,$3,$4,$5,CURRENT_DATE,$6)`,
+		pid, name, desc, projectCreatorID, creatorName, imgBytes)
+	if err != nil {
+		respondErr(c, http.StatusInternalServerError, "failed to insert into deleted_projects", err)
+		return
+	}
+
+	// delete from approved_projects
+	cmdTag, err := tx.Exec(context.Background(), `DELETE FROM approved_projects WHERE p_id=$1`, pid)
+	if err != nil {
+		respondErr(c, http.StatusInternalServerError, "failed to delete approved project", err)
+		return
+	}
+	if cmdTag.RowsAffected() == 0 {
+		respondErr(c, http.StatusNotFound, "project not found during delete", nil)
+		return
+	}
+
+	if err := tx.Commit(context.Background()); err != nil {
+		respondErr(c, http.StatusInternalServerError, "tx commit failed", err)
+		return
+	}
+
+	c.Status(http.StatusNoContent)
+}
+
 // addMaintainer
 func addMaintainer(c *gin.Context) {
 	authedUserID, ok := getUserIDFromContext(c)
