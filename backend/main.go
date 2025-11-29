@@ -1,3 +1,286 @@
+package main
+
+import (
+	"context"
+	"encoding/base64"
+	"fmt"
+	"io"
+	"log"
+	"mime/multipart"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/GCET-Open-Source-Foundation/auth"
+	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgconn"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+var (
+	conn  *pgxpool.Pool
+	auth1 *auth.Auth
+)
+
+// Permission spaces and role constants
+const (
+	SpaceSuperadmins = "superadmins"
+	SpaceAdmins      = "admins"
+	SpaceUsers       = "SpaceUsers" // default user space
+	MemberRole       = "member"
+)
+
+// ---------------- Models ----------------
+
+type Project struct {
+	PID         int       `json:"p_id"`
+	Name        string    `json:"name"`
+	Description string    `json:"description"`
+	CreatorID   int       `json:"creator_id"`
+	CreatorName string    `json:"creator_name"`
+	StartDate   time.Time `json:"start_date"`
+	Status      string    `json:"status"`
+	Image       string    `json:"image,omitempty"` // base64 encoded
+}
+
+type BufferProject struct {
+	RID         int       `json:"r_id"`
+	Name        string    `json:"name"`
+	Description string    `json:"description"`
+	CreatorID   int       `json:"creator_id"`
+	CreatorName string    `json:"creator_name"`
+	Status      string    `json:"status"`
+	SubmittedAt time.Time `json:"submitted_at"`
+	Image       string    `json:"image,omitempty"`
+}
+
+type DeletedProject struct {
+	PID         int       `json:"p_id"`
+	Name        string    `json:"name"`
+	Description string    `json:"description"`
+	CreatorID   int       `json:"creator_id"`
+	CreatorName string    `json:"creator_name"`
+	DeletedDate time.Time `json:"deleted_date"`
+	Image       string    `json:"image,omitempty"`
+}
+
+type proj_info struct {
+	PID         int        `json:"p_id"`
+	Name        string     `json:"name"`
+	Description string     `json:"description"`
+	CreatorID   int        `json:"creator_id"`
+	CreatorName string     `json:"creator_name"`
+	StartDate   *time.Time `json:"start_date,omitempty"`
+	Status      string     `json:"status"`
+	EndDate     *time.Time `json:"end_date,omitempty"`
+}
+
+// ---------------- Request structs ----------------
+
+type registerReq struct {
+	Username string `json:"username" form:"username" binding:"required"`
+	Password string `json:"password" form:"password" binding:"required"`
+}
+
+type createProjectReq struct {
+	Name        string `form:"name" binding:"required"`
+	Description string `form:"description" binding:"required"`
+}
+
+type addMaintainerReq struct {
+	UserID   int    `json:"user_id" binding:"required"`
+	UserName string `json:"user_name" binding:"required"`
+}
+
+type addContributorReq struct {
+	UserID   int    `json:"user_id" binding:"required"`
+	UserName string `json:"user_name" binding:"required"`
+}
+
+type updateProjectStatusReq struct {
+	NewStatus string `json:"new_status" binding:"required"`
+}
+
+type assignUserReq struct {
+	UserID   int    `json:"user_id" binding:"required"`
+	UserName string `json:"user_name" binding:"required"`
+}
+
+type revokeUserReq struct {
+	UserID int `json:"user_id" binding:"required"`
+}
+
+// ---------------- Helpers ----------------
+
+func respondErr(c *gin.Context, code int, msg string, err error) {
+	if err != nil {
+		log.Printf("Error: %s: %v\n", msg, err)
+	} else {
+		log.Printf("Error: %s\n", msg)
+	}
+	c.JSON(code, gin.H{"error": msg})
+}
+
+func uidToStr(id int) string { return strconv.Itoa(id) }
+
+func getIntParam(c *gin.Context, name string) (int, error) {
+	p := c.Param(name)
+	return strconv.Atoi(p)
+}
+
+// getUserIDFromContext attempts to find numeric user id in context (user_id_int or user_id).
+// Returns (id, true) if found and parseable to int, otherwise (-1,false)
+func getUserIDFromContext(c *gin.Context) (int, bool) {
+	// check user_id_int set by middleware
+	if v, ok := c.Get("user_id_int"); ok {
+		switch t := v.(type) {
+		case int:
+			return t, true
+		case int32:
+			return int(t), true
+		case int64:
+			return int(t), true
+		case string:
+			if n, err := strconv.Atoi(t); err == nil {
+				return n, true
+			}
+		}
+	}
+
+	// check user_id (string)
+	if v, ok := c.Get("user_id"); ok {
+		switch t := v.(type) {
+		case string:
+			if n, err := strconv.Atoi(t); err == nil {
+				return n, true
+			}
+		case int:
+			return t, true
+		case int32:
+			return int(t), true
+		case int64:
+			return int(t), true
+		}
+	}
+	return -1, false
+}
+
+// HasRole checks permission via auth.Check_permissions for superadmin/admin, returns true for "user"
+func HasRole(userIDStr string, require string) bool {
+	if require == "superadmin" {
+		return auth1.Check_permissions(userIDStr, SpaceSuperadmins, MemberRole)
+	}
+	if require == "admin" {
+		return auth1.Check_permissions(userIDStr, SpaceAdmins, MemberRole)
+	}
+	if require == "user" {
+		return true
+	}
+	return false
+}
+
+// AssignMemberToSpace upserts into names table and creates permission in auth DB
+func AssignMemberToSpace(userID interface{}, userName, space string) error {
+	// upsert into names table using TEXT id (to support string and numeric ids)
+	_, err := conn.Exec(context.Background(),
+		`INSERT INTO names (id, name) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name`,
+		userID, userName)
+	if err != nil {
+		return fmt.Errorf("upsert names failed: %w", err)
+	}
+
+	// ensure we pass a string user id to auth.Create_permissions
+	var uidStr string
+	switch v := userID.(type) {
+	case int:
+		uidStr = strconv.Itoa(v)
+	case int32:
+		uidStr = fmt.Sprintf("%d", v)
+	case int64:
+		uidStr = fmt.Sprintf("%d", v)
+	case string:
+		uidStr = v
+	default:
+		uidStr = fmt.Sprintf("%v", v)
+	}
+
+	if err := auth1.Create_permissions(uidStr, space, MemberRole); err != nil {
+		return fmt.Errorf("auth.Create_permissions failed: %w", err)
+	}
+	return nil
+}
+
+func RemoveMemberFromSpace(userID int, space string) error {
+	if err := auth1.Delete_permission(uidToStr(userID), space, MemberRole); err != nil {
+		return fmt.Errorf("auth.Delete_permission failed: %w", err)
+	}
+	return nil
+}
+
+// ---------------- Permission helpers ----------------
+
+func isProjectAdminOrCreator(authedUserID int, p_id int) (bool, error) {
+	authedUserIDStr := uidToStr(authedUserID)
+	if HasRole(authedUserIDStr, "superadmin") || HasRole(authedUserIDStr, "admin") {
+		return true, nil
+	}
+
+	var creatorID int
+	err := conn.QueryRow(context.Background(),
+		"SELECT creator_id FROM approved_projects WHERE p_id = $1", p_id).Scan(&creatorID)
+
+	if err == pgx.ErrNoRows {
+		return false, fmt.Errorf("project not found")
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to check project ownership: %w", err)
+	}
+
+	return creatorID == authedUserID, nil
+}
+
+func isProjectCreatorOrMaintainer(authedUserID int, p_id int) (bool, error) {
+	var creatorID int
+	err := conn.QueryRow(context.Background(),
+		"SELECT creator_id FROM approved_projects WHERE p_id = $1", p_id).Scan(&creatorID)
+	if err == pgx.ErrNoRows {
+		return false, fmt.Errorf("project not found")
+	}
+	if err != nil {
+		return false, fmt.Errorf("db error checking creator: %w", err)
+	}
+	if creatorID == authedUserID {
+		return true, nil
+	}
+
+	var isMaintainer bool
+	err = conn.QueryRow(context.Background(),
+		"SELECT EXISTS(SELECT 1 FROM maintainers WHERE p_id = $1 AND user_id = $2)",
+		p_id, authedUserID).Scan(&isMaintainer)
+	if err != nil {
+		return false, fmt.Errorf("db error checking maintainer: %w", err)
+	}
+
+	return isMaintainer, nil
+}
+
+func isProjectAdminOrCreatorOrMaintainer(authedUserID int, p_id int) (bool, error) {
+	authedUserIDStr := uidToStr(authedUserID)
+	if HasRole(authedUserIDStr, "superadmin") || HasRole(authedUserIDStr, "admin") {
+		return true, nil
+	}
+
+	isAllowed, err := isProjectCreatorOrMaintainer(authedUserID, p_id)
+	if err != nil {
+		return false, err
+	}
+
+	return isAllowed, nil
+}
+
 // ---------------- Middleware ----------------
 
 // AuthMiddleware validates JWT from Authorization header and sets user_id and user_id_int in context.
